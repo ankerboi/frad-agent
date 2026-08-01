@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-Krij -> csgo_gc bridge agent (GUI version).
+Krij -> csgo_gc bridge agent (web‑view version with auto‑install).
 
-Minimal dark window with a green "connected" box and a Logs button.
-Stdlib only - no pip installs needed.
-
-Usage:
-    pythonw krij_gc_agent_gui.py --csgo-dir "C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive"
-    (use pythonw on Windows to hide the console)
+Opens a native window showing https://krij-mod.vercel.app while the agent runs
+in the background. If pywebview is missing, it auto‑installs it.
 """
 
 from __future__ import annotations
@@ -17,6 +13,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -26,18 +23,15 @@ import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import tkinter as tk
-from tkinter import scrolledtext
 
 MAX_BODY = 4 * 1024 * 1024
 PROJECT_ID = "8ef47b30-16d4-409d-baaa-3a3602adc4f2"
 MAX_LOG_LINES = 500
 
-# Shared log buffer (thread-safe)
+# Shared log buffer
 LOG_BUFFER: deque[str] = deque(maxlen=MAX_LOG_LINES)
 LOG_PENDING: deque[str] = deque(maxlen=MAX_LOG_LINES)
 LOG_LOCK = threading.Lock()
-
 
 
 class Config:
@@ -59,12 +53,7 @@ def log(msg: str) -> None:
     with LOG_LOCK:
         LOG_BUFFER.append(line)
         LOG_PENDING.append(line)
-    # Never touch Tkinter from worker threads - the GUI polls LOG_PENDING.
-    try:
-        print(line, flush=True)
-    except Exception:
-        pass
-
+    print(line, flush=True)
 
 
 def sha(text: str) -> str:
@@ -110,12 +99,14 @@ def is_trusted_project_origin(origin: str) -> bool:
             return True
         if parsed.scheme != "https":
             return False
-        return host in {
+        trusted = {
             f"id-preview--{PROJECT_ID}.lovable.app",
             f"project--{PROJECT_ID}.lovable.app",
             f"project--{PROJECT_ID}-dev.lovable.app",
             f"{PROJECT_ID}.lovableproject.com",
+            "krij-mod.vercel.app",          # added
         }
+        return host in trusted
     except ValueError:
         return False
 
@@ -291,272 +282,41 @@ def resolve_target(csgo_dir, out) -> Path:
     return Path.cwd() / "csgo_gc" / "inventory.txt"
 
 
-def hide_console():
-    """Hide the console window on Windows so only the GUI is visible."""
-    if sys.platform != "win32":
-        return
+def start_server(host: str, port: int) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer((host, port), Handler)
+    log(f"listening on http://{host}:{port}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def ensure_pywebview() -> bool:
+    """Try to import webview; if missing, attempt to install it via pip."""
     try:
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
-    except Exception:
-        pass
-
-
-class RoundedBox(tk.Canvas):
-    """Simple rounded rectangle with centered text (no external libs)."""
-
-    def __init__(self, master, text="connected", radius=14, **kwargs):
-        super().__init__(master, highlightthickness=0, **kwargs)
-        self.radius = radius
-        self.text = text
-        self.bind("<Configure>", self._redraw)
-
-    def _redraw(self, _event=None):
-        self.delete("all")
-        w = self.winfo_width()
-        h = self.winfo_height()
-        r = min(self.radius, w // 2, h // 2)
-        # Green fill
-        self.create_round_rect(0, 0, w, h, r, fill="#16a34a", outline="#22c55e", width=2)
-        self.create_text(
-            w // 2, h // 2,
-            text=self.text,
-            fill="#ffffff",
-            font=("Segoe UI", 14, "bold"),
-        )
-
-    def create_round_rect(self, x1, y1, x2, y2, r, **kwargs):
-        points = [
-            x1 + r, y1,
-            x2 - r, y1,
-            x2, y1,
-            x2, y1 + r,
-            x2, y2 - r,
-            x2, y2,
-            x2 - r, y2,
-            x1 + r, y2,
-            x1, y2,
-            x1, y2 - r,
-            x1, y1 + r,
-            x1, y1,
-        ]
-        return self.create_polygon(points, smooth=True, **kwargs)
-
-
-class AgentGUI:
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.server: ThreadingHTTPServer | None = None
-        self.log_win: tk.Toplevel | None = None
-        self.log_text: scrolledtext.ScrolledText | None = None
-
-        self.root = tk.Tk()
-        self.root.title("")  # no title text
-        self.root.configure(bg="#1a1a1a")
-        self.root.resizable(False, False)
-        self.root.geometry("280x140")
-        # White icon so it blends into the Windows title bar
+        import webview
+        return True
+    except ImportError:
+        log("pywebview not found. Attempting to install...")
         try:
-            # 16x16 solid white image
-            white = tk.PhotoImage(width=16, height=16)
-            white.put("#ffffff", to=(0, 0, 16, 16))
-            self.root.iconphoto(True, white)
-            self._window_icon = white  # keep reference
-        except Exception:
-            pass
-        try:
-            self.root.iconbitmap("")
-        except Exception:
-            pass
-
-        # Center
-        self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() // 2) - 140
-        y = (self.root.winfo_screenheight() // 2) - 70
-        self.root.geometry(f"+{x}+{y}")
-
-        # Top bar with Logs button (top-right)
-        top = tk.Frame(self.root, bg="#1a1a1a", height=28)
-        top.pack(fill="x", side="top")
-        top.pack_propagate(False)
-
-        self.logs_btn = tk.Button(
-            top,
-            text="logs",
-            font=("Segoe UI", 8),
-            fg="#cccccc",
-            bg="#2a2a2a",
-            activeforeground="#ffffff",
-            activebackground="#3a3a3a",
-            relief="flat",
-            bd=0,
-            padx=10,
-            pady=2,
-            cursor="hand2",
-            command=self.toggle_logs,
-        )
-        self.logs_btn.pack(side="right", padx=8, pady=4)
-
-        # Center area with green connected box
-        center = tk.Frame(self.root, bg="#1a1a1a")
-        center.pack(expand=True, fill="both")
-
-        self.box = RoundedBox(
-            center,
-            text="connected",
-            radius=16,
-            width=160,
-            height=52,
-            bg="#1a1a1a",
-        )
-        self.box.place(relx=0.5, rely=0.5, anchor="center")
-
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        # Poll new log lines from the GUI thread (Tk is not thread-safe).
-        self.root.after(300, self._drain_logs)
-
-    def _drain_logs(self):
-        try:
-            with LOG_LOCK:
-                lines = list(LOG_PENDING)
-                LOG_PENDING.clear()
-            if lines and self.log_text and self.log_win and self.log_win.winfo_exists():
-                self.log_text.configure(state="normal")
-                for line in lines:
-                    self.log_text.insert("end", line + "\n")
-                self.log_text.see("end")
-                self.log_text.configure(state="disabled")
-        except Exception:
-            pass
-        try:
-            self.root.after(300, self._drain_logs)
-        except Exception:
-            pass
-
-
-    def toggle_logs(self):
-        if self.log_win and self.log_win.winfo_exists():
-            self.log_win.lift()
-            return
-
-        self.log_win = tk.Toplevel(self.root)
-        self.log_win.title("Krij GC Agent — Logs")
-        self.log_win.configure(bg="#1a1a1a")
-        self.log_win.geometry("520x320")
-        self.log_win.minsize(360, 200)
-
-        # Position near main window
-        try:
-            mx = self.root.winfo_x()
-            my = self.root.winfo_y()
-            self.log_win.geometry(f"+{mx + 20}+{my + 40}")
-        except Exception:
-            pass
-
-        header = tk.Frame(self.log_win, bg="#1a1a1a")
-        header.pack(fill="x", padx=8, pady=(8, 4))
-
-        tk.Label(
-            header,
-            text="Logs",
-            fg="#e5e5e5",
-            bg="#1a1a1a",
-            font=("Segoe UI", 11, "bold"),
-        ).pack(side="left")
-
-        clear_btn = tk.Button(
-            header,
-            text="clear",
-            font=("Segoe UI", 8),
-            fg="#aaaaaa",
-            bg="#2a2a2a",
-            activeforeground="#ffffff",
-            activebackground="#3a3a3a",
-            relief="flat",
-            bd=0,
-            padx=8,
-            pady=1,
-            cursor="hand2",
-            command=self._clear_logs,
-        )
-        clear_btn.pack(side="right")
-
-        self.log_text = scrolledtext.ScrolledText(
-            self.log_win,
-            wrap="word",
-            font=("Consolas", 9),
-            bg="#111111",
-            fg="#d4d4d4",
-            insertbackground="#ffffff",
-            relief="flat",
-            bd=0,
-            padx=8,
-            pady=8,
-            state="disabled",
-        )
-        self.log_text.pack(expand=True, fill="both", padx=8, pady=(0, 8))
-
-        # Load existing buffer
-        with LOG_LOCK:
-            lines = list(LOG_BUFFER)
-        self.log_text.configure(state="normal")
-        for line in lines:
-            self.log_text.insert("end", line + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
-
-        self.log_win.protocol("WM_DELETE_WINDOW", self._close_logs)
-
-    def _clear_logs(self):
-        with LOG_LOCK:
-            LOG_BUFFER.clear()
-        if self.log_text:
-            self.log_text.configure(state="normal")
-            self.log_text.delete("1.0", "end")
-            self.log_text.configure(state="disabled")
-
-    def _close_logs(self):
-        if self.log_win:
-            self.log_win.destroy()
-        self.log_win = None
-        self.log_text = None
-
-    def start_server(self):
-        def run():
-            try:
-                self.server = ThreadingHTTPServer((self.host, self.port), Handler)
-                log(f"listening on http://{self.host}:{self.port}")
-                self.server.serve_forever()
-            except Exception as exc:
-                log(f"server error: {exc}")
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-
-    def on_close(self):
-        log("shutting down")
-        if self.server:
-            try:
-                self.server.shutdown()
-            except Exception:
-                pass
-        if self.log_win and self.log_win.winfo_exists():
-            self.log_win.destroy()
-        self.root.destroy()
-
-    def run(self):
-        self.root.mainloop()
+            # Try pip or pip3
+            pip_cmd = "pip"
+            # Check if pip3 exists (prefer pip3 on some systems)
+            for cmd in ("pip3", "pip"):
+                if shutil.which(cmd):
+                    pip_cmd = cmd
+                    break
+            subprocess.check_call([pip_cmd, "install", "pywebview"])
+            # After installation, try importing again
+            import webview
+            log("pywebview installed successfully.")
+            return True
+        except Exception as e:
+            log(f"Failed to install pywebview: {e}")
+            return False
 
 
 def main() -> int:
-    # Hide console so only the GUI window is visible
-    hide_console()
-
-    ap = argparse.ArgumentParser(description="Krij -> csgo_gc inventory bridge (GUI)")
+    ap = argparse.ArgumentParser(description="Krij -> csgo_gc inventory bridge (web‑view)")
     ap.add_argument("--csgo-dir", help="CS:GO install folder (or its csgo/ subfolder)")
     ap.add_argument("--out", help="Explicit path to inventory.txt (overrides --csgo-dir)")
     ap.add_argument("--port", type=int, default=17352)
@@ -570,6 +330,7 @@ def main() -> int:
     )
     ap.add_argument("--allow-unsigned", action="store_true")
     ap.add_argument("--no-enforce", action="store_true")
+    ap.add_argument("--no-web", action="store_true", help="Run headless (no web window)")
     args = ap.parse_args()
 
     CFG.target = resolve_target(args.csgo_dir, args.out)
@@ -583,13 +344,50 @@ def main() -> int:
     log(f"writing to: {CFG.target}")
     log(f"signatures: {'required' if CFG.require_signature else 'DISABLED'}")
     log(f"tamper lock: {'on' if CFG.enforce else 'off'}")
+    log(f"trusted origins include krij-mod.vercel.app")
 
     if CFG.enforce:
         threading.Thread(target=watchdog, daemon=True).start()
 
-    gui = AgentGUI(args.host, args.port)
-    gui.start_server()
-    gui.run()
+    # Start the HTTP server
+    server = start_server(args.host, args.port)
+
+    if not args.no_web:
+        webview_available = ensure_pywebview()
+        if webview_available:
+            import webview
+            # Create the web view window
+            webview.create_window(
+                "Krij Agent",
+                "https://krij-mod.vercel.app",
+                width=1200,
+                height=800,
+                resizable=True,
+                fullscreen=False,
+                min_size=(800, 600),
+                confirm_close=True,
+            )
+            # Run the GUI loop (this blocks until the window is closed)
+            webview.start(debug=False, http_server=False)
+            # After window closes, shut down the server
+            log("web window closed, shutting down...")
+        else:
+            log("pywebview not available – running in headless mode (press Ctrl+C to stop).")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                log("shutting down by user request")
+    else:
+        log("Running in headless mode (press Ctrl+C to stop).")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            log("shutting down by user request")
+
+    server.shutdown()
+    server.server_close()
     return 0
 
 
