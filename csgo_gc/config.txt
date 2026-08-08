@@ -10,11 +10,11 @@
 }
 
 "vac_banned"	"0"
-"cmd_friendly"	"1"
-"cmd_teaching"	"1"
-"cmd_leader"	"1"
-"player_level"	"1"
-"player_cur_xp"	"1"
+"cmd_friendly"	"0"
+"cmd_teaching"	"0"
+"cmd_leader"	"0"
+"player_level"	"0"
+"player_cur_xp"	"0"
 
 // these are the same weights valve uses
 "rarity_weights"
